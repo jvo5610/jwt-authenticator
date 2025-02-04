@@ -10,11 +10,18 @@
 #include <openssl/evp.h>
 #include <microhttpd.h>
 #include <cstdlib>
+#include <csignal>
+#include <unistd.h>
+#include <atomic>
+
+// Global variables
+std::atomic<bool> running(true);
+struct MHD_Daemon* http_daemon = nullptr;
 
 using json = nlohmann::json;
 using namespace std;
 
-const int PORT = 8080;
+const int PORT = 3000;
 const string AUTH0_DOMAIN = getenv("AUTH0_DOMAIN");
 const string JWKS_URL = "https://" + AUTH0_DOMAIN + "/.well-known/jwks.json";
 
@@ -42,6 +49,12 @@ void log_message(LogLevel level, const string& message) {
         else if (level == ERROR) prefix = "[ERROR] ";
         cout << prefix << message << endl;
     }
+}
+
+// Signal handler function
+void signal_handler(int signum) {
+    log_message(INFO, "Received termination signal. Shutting down...");
+    running = false;
 }
 
 // Function to fetch JWKS
@@ -245,17 +258,37 @@ MHD_Result request_handler(void* cls, struct MHD_Connection* connection,
 // Start HTTP server
 void start_server() {
     log_message(INFO, "HTTP Server running on port " + to_string(PORT));
-    struct MHD_Daemon* daemon = MHD_start_daemon(MHD_USE_THREAD_PER_CONNECTION, PORT,
-                                                 NULL, NULL, &request_handler, NULL,
-                                                 MHD_OPTION_END);
-    if (!daemon) log_message(ERROR, "Failed to start HTTP server.");
-    getchar();
-    MHD_stop_daemon(daemon);
+    
+    http_daemon = MHD_start_daemon(MHD_USE_THREAD_PER_CONNECTION, PORT,
+                              NULL, NULL, &request_handler, NULL,
+                              MHD_OPTION_END);
+    if (!daemon) {
+        log_message(ERROR, "Failed to start HTTP server.");
+        return;
+    }
+
+    // Wait until signal is received
+    while (running) {
+        sleep(1);  // Prevents busy-waiting
+    }
+
+    log_message(INFO, "Stopping HTTP server...");
+    MHD_stop_daemon(http_daemon);
 }
 
-// Main Function
+// Main function
 int main() {
     set_log_level();
+
+    // Setup signal handlers
+    struct sigaction action{};
+    action.sa_handler = signal_handler;
+    sigemptyset(&action.sa_mask);
+    action.sa_flags = 0;
+
+    sigaction(SIGINT, &action, NULL);
+    sigaction(SIGTERM, &action, NULL);
+
     start_server();
     return 0;
 }
