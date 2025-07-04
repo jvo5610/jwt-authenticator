@@ -473,11 +473,11 @@ bool verify_jwt(const std::string &token)
         return true;
     }
     catch (const std::exception& e) {
-        log_message(ERROR, std::string("JWT verification threw exception: ") + e.what());
+        log_message(WARN, std::string("JWT verification threw exception: ") + e.what());
         return false;
     }
     catch (...) {
-        log_message(ERROR, "JWT verification threw unknown exception.");
+        log_message(WARN, "JWT verification threw unknown exception.");
         return false;
     }
 }
