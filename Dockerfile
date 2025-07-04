@@ -4,7 +4,6 @@
 FROM ubuntu:22.04 AS builder
 
 ENV DEBIAN_FRONTEND=noninteractive
-ENV LD_LIBRARY_PATH=/usr/local/lib:$LD_LIBRARY_PATH
 
 # Install dependencies
 RUN apt-get update && apt-get upgrade -y && \
@@ -20,7 +19,7 @@ RUN apt-get update && apt-get upgrade -y && \
     && rm -rf /var/lib/apt/lists/*
 
 # Build libhv
-RUN git clone --depth 1 https://github.com/ithewei/libhv.git /tmp/libhv && \
+RUN git clone --branch v1.3.3 https://github.com/ithewei/libhv.git /tmp/libhv && \
     cd /tmp/libhv && mkdir build && cd build && \
     cmake -DBUILD_SHARED_LIBS=ON .. && make -j$(nproc) && make install && \
     ldconfig && \
