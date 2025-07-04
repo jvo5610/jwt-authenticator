@@ -286,34 +286,32 @@ string get_cached_jwks()
 // Base64 URL decoding
 string base64_url_decode(const string &input)
 {
-    try{
+    try {
         string base64 = input;
         replace(base64.begin(), base64.end(), '-', '+');
         replace(base64.begin(), base64.end(), '_', '/');
         while (base64.size() % 4 != 0)
             base64 += '=';
-
+        
         BIO *bio, *b64;
-        int length = base64.size() * 3 / 4;
-        unsigned char *buffer = (unsigned char *)malloc(length);
+        int length = base64.size() * 3 / 4 + 1;
+        vector<char> buffer(length);
 
-        bio = BIO_new_mem_buf(base64.c_str(), -1);
+        bio = BIO_new_mem_buf((void*)base64.data(), base64.size());
         b64 = BIO_new(BIO_f_base64());
         BIO_set_flags(b64, BIO_FLAGS_BASE64_NO_NL);
         bio = BIO_push(b64, bio);
 
-        int decoded_length = BIO_read(bio, buffer, length);
-        if (decoded_length <= 0) throw runtime_error("Failed to decode base64.");
+        int decoded_length = BIO_read(bio, buffer.data(), length);
         BIO_free_all(bio);
-        string output((char *)buffer, decoded_length);
-        free(buffer);
 
-        return output;
+        if (decoded_length <= 0) throw runtime_error("Failed to decode base64.");
+
+        return string(buffer.data(), decoded_length);
     } catch (const exception& e) {
-        log_message(ERROR, string("Base64 decode failed: ") + e.what());
+        log_message(WARN, string("Base64 decode failed: ") + e.what());
         return "";
     }
-    
 }
 
 // Extract KID from JWT header
@@ -329,11 +327,11 @@ string extract_kid(const string &token)
     try {
         header = json::parse(header_json);
     } catch (const std::exception &e) {
-        log_message(ERROR, string("Failed to parse JWT header JSON: ") + e.what());
+        log_message(WARN, string("Failed to parse JWT header JSON: ") + e.what());
         return "";
     }
     if (header["alg"] != "RS256") {
-        log_message(ERROR, "Unsupported JWT algorithm: " + header["alg"].get<string>());
+        log_message(WARN, "Unsupported JWT algorithm: " + header["alg"].get<string>());
         return "";
     }
     return header["kid"];
@@ -407,7 +405,7 @@ bool verify_signature(EVP_PKEY *public_key, const string &header_payload, const 
 }
 
 // Verify JWT
-bool verify_jwt(const string &token)
+bool verify_jwt(const std::string &token)
 {
     struct TimerGuard {
         std::chrono::high_resolution_clock::time_point start;
@@ -421,34 +419,65 @@ bool verify_jwt(const string &token)
             total_validation_time_ns += duration_ns;
             jwt_validations_in_progress--;
         }
-    } guard;  // <-- Se activa aquí
+    } guard;
 
     try {
-        if (!validate_expiration(token)){
-            log_message(WARN, "Token failed expiration check.");
+        log_message(DEBUG, "Starting JWT verification: prefix = " + token.substr(0, 20));
+
+        // Step 1: expiration
+        if (!validate_expiration(token)) {
+            log_message(DEBUG, "JWT verification failed: expiration check.");
             return false;
         }
 
+        // Step 2: split token
         size_t first_dot = token.find('.');
         size_t second_dot = token.find('.', first_dot + 1);
-        if (first_dot == string::npos || second_dot == string::npos)
-            return false;
-
-        string header_payload = token.substr(0, second_dot);
-        string signature_b64 = token.substr(second_dot + 1);
-        string signature = base64_url_decode(signature_b64);
-
-        string kid = extract_kid(token);
-        log_message(DEBUG, "Request extracted kid: " + kid);
-
-        EVP_PKEY* public_key = get_cached_pubkey(kid);
-        if (!public_key) {
-            log_message(ERROR, "Public key not found for kid: " + kid);
+        if (first_dot == std::string::npos || second_dot == std::string::npos) {
+            log_message(DEBUG, "JWT verification failed: token does not have correct JWT format.");
             return false;
         }
 
-        return verify_signature(public_key, header_payload, signature);
-    } catch (...) {
+        std::string header_payload = token.substr(0, second_dot);
+        std::string signature_b64 = token.substr(second_dot + 1);
+        std::string signature = base64_url_decode(signature_b64);
+
+        if (signature.empty()) {
+            log_message(DEBUG, "JWT verification failed: signature part is empty or could not be decoded.");
+            return false;
+        }
+
+        // Step 3: extract kid
+        std::string kid = extract_kid(token);
+        if (kid.empty()) {
+            log_message(DEBUG, "JWT verification failed: unable to extract KID.");
+            return false;
+        }
+
+        log_message(DEBUG, "JWT extracted KID: " + kid);
+
+        // Step 4: get public key
+        EVP_PKEY* public_key = get_cached_pubkey(kid);
+        if (!public_key) {
+            log_message(DEBUG, "JWT verification failed: no public key found for KID.");
+            return false;
+        }
+
+        // Step 5: verify signature
+        if (!verify_signature(public_key, header_payload, signature)) {
+            log_message(DEBUG, "JWT verification failed: signature did not match.");
+            return false;
+        }
+
+        log_message(DEBUG, "JWT successfully verified.");
+        return true;
+    }
+    catch (const std::exception& e) {
+        log_message(ERROR, std::string("JWT verification threw exception: ") + e.what());
+        return false;
+    }
+    catch (...) {
+        log_message(ERROR, "JWT verification threw unknown exception.");
         return false;
     }
 }
@@ -474,32 +503,42 @@ void start_server() {
         return resp->String(metrics);
     });
 
-    router.GET("/", [](HttpRequest* req, HttpResponse* resp) {
-        std::string auth = req->GetHeader("Authorization");
-        std::string response;
-        int code = 403;
+    router.POST("/", [](HttpRequest* req, HttpResponse* resp) {
+    std::string auth = req->GetHeader("Authorization");
 
-        if (!auth.empty() && auth.rfind("Bearer ", 0) == 0) {
-            std::string token = auth.substr(7);
+    // Trim utility
+    auto trim = [](std::string s) -> std::string {
+        s.erase(0, s.find_first_not_of(" \t\r\n"));
+        s.erase(s.find_last_not_of(" \t\r\n") + 1);
+        return s;
+    };
 
-            if (verify_jwt(token)) {
-                valid_requests++;
-                response = "JWT is valid.";
-                code = 200;
-                log_message(INFO, "Valid JWT received");
-            } else {
-                invalid_requests++;
-                response = "JWT verification failed.";
-                log_message(WARN, "JWT verification failed");
-            }
+    auth = trim(auth);
+
+    if (!auth.empty() && auth.rfind("Bearer ", 0) == 0) {
+        std::string token = trim(auth.substr(7));
+
+        if (verify_jwt(token)) {
+            valid_requests++;
+            resp->status_code = HTTP_STATUS_OK;
+            resp->SetBody("JWT is valid.");
+            log_message(INFO, "Valid JWT received");
+            return -1;
         } else {
-            response = "Missing or invalid Authorization header.";
-            log_message(WARN, "No valid Authorization header");
+            invalid_requests++;
+            resp->status_code = HTTP_STATUS_FORBIDDEN;
+            resp->SetBody("JWT verification failed.");
+            log_message(WARN, "JWT verification failed");
+            return -1;
         }
+    } else {
+        resp->status_code = HTTP_STATUS_FORBIDDEN;
+        resp->SetBody("Missing or invalid Authorization header.");
+        log_message(WARN, "No valid Authorization header");
+        return -1;
+    }
+});
 
-        resp->status_code = static_cast<http_status>(code);
-        return resp->String(response);
-    });
 
     hv::HttpServer server;
     server.service = &router;
