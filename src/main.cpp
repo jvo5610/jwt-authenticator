@@ -1,46 +1,80 @@
+// Standard libraries
 #include <iostream>
 #include <string>
 #include <vector>
-#include <curl/curl.h>
+#include <cstdlib>
+#include <csignal>
 #include <ctime>
+#include <thread>
+#include <mutex>
+#include <chrono>
+#include <atomic>
+#include <condition_variable>
+#include <unordered_map>
+#include <unistd.h>
+
+// Third-party libraries
+#include <curl/curl.h>
 #include <nlohmann/json.hpp>
 #include <openssl/pem.h>
 #include <openssl/x509.h>
 #include <openssl/rsa.h>
 #include <openssl/evp.h>
-#include <microhttpd.h>
-#include <cstdlib>
-#include <csignal>
-#include <unistd.h>
-#include <mutex>
-#include <thread>
-#include <chrono>
-#include <atomic>
+#include <hv/HttpServer.h>
 
+// Namespaces
 using json = nlohmann::json;
 using namespace std;
 
-// Globals
+// =====================
+// GLOBALS
+// =====================
+
+// Env vars
+const string JWKS_URL = getenv("JWKS_URL");
+const int JWKS_REFRESH_INTERVAL = getenv("JWKS_REFRESH_INTERVAL") 
+    ? std::max(atoi(getenv("JWKS_REFRESH_INTERVAL")), 1) 
+    : 600;
+const int PORT = getenv("PORT") 
+    ? std::max(atoi(getenv("PORT")), 1) 
+    : 3000;
+
+// Server status
+std::atomic<bool> running(true);
+
+// ========================
+// SYNC AND STATUS
+// ========================
+
+std::mutex shutdown_mutex;
+std::condition_variable shutdown_cv;
+
+// JWT cache and locks
 std::mutex jwks_mutex;
+std::mutex jwks_map_mutex;
 std::string jwks_cache;
 std::time_t last_jwks_update = 0;
-const int PORT = 3000;
-const int JWKS_REFRESH_INTERVAL = 600; // Refresh every 5 minutes
-const string JWKS_URL = getenv("JWKS_URL");
 
-// Global variables
-std::atomic<bool> running(true);
-struct MHD_Daemon *http_daemon = nullptr;
+// Metrics validations
+std::atomic<int> valid_requests(0);
+std::atomic<int> invalid_requests(0);
+std::atomic<int> jwt_validations_in_progress(0);
+std::atomic<long> total_validation_time_ns(0);
 
-// Logging levels
-enum LogLevel
-{
-    DEBUG,
-    INFO,
-    WARN,
-    ERROR
+// Cached keys structure
+struct JwkEntry {
+    json key;
+    EVP_PKEY* public_key;
 };
+std::unordered_map<std::string, JwkEntry> jwks_map;
+
+// ==================
+// LOGS
+// ==================
+
+enum LogLevel { DEBUG, INFO, WARN, ERROR };
 LogLevel current_log_level = ERROR; // Default to ERROR
+
 
 void set_log_level()
 {
@@ -85,45 +119,100 @@ size_t write_callback(void *contents, size_t size, size_t nmemb, string *output)
 
 string fetch_jwks()
 {
-    CURL *curl = curl_easy_init();
-    string response;
-    if (curl)
+    int attempts = 3;
+    while (attempts-- > 0)
     {
-        curl_easy_setopt(curl, CURLOPT_URL, JWKS_URL.c_str());
-        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
-        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
-        curl_easy_perform(curl);
-        curl_easy_cleanup(curl);
+        CURL *curl = curl_easy_init();
+        string response;
+        if (curl)
+        {
+            curl_easy_setopt(curl, CURLOPT_URL, JWKS_URL.c_str());
+            curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
+            curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+            CURLcode res = curl_easy_perform(curl);
+            curl_easy_cleanup(curl);
+
+            if (res == CURLE_OK && !response.empty()) {
+                return response;
+            } else {
+                log_message(WARN, "Attempt to fetch JWKS failed. Retrying...");
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::seconds(1));
     }
-    return response;
+
+    log_message(ERROR, "Failed to fetch JWKS after 3 attempts.");
+    return "";
 }
 
-// Signal handler function
-void signal_handler(int signum)
+// Convert PEM certificate to RSA Public Key
+EVP_PKEY *convert_pem_to_evp(const string &pem_cert)
 {
-    log_message(INFO, "Received termination signal. Shutting down...");
-    running = false;
+    BIO *bio = BIO_new_mem_buf(pem_cert.c_str(), -1);
+    if (!bio) {
+        log_message(ERROR, "BIO_new_mem_buf failed.");
+        return nullptr;
+    }
+
+    X509 *x509 = PEM_read_bio_X509(bio, NULL, NULL, NULL);
+    if (!x509) {
+        log_message(ERROR, "PEM_read_bio_X509 failed: unable to parse certificate.");
+        BIO_free(bio);
+        return nullptr;
+    }
+
+    EVP_PKEY *pkey = X509_get_pubkey(x509);
+    if (!pkey) {
+        log_message(ERROR, "X509_get_pubkey failed: could not extract public key.");
+    }
+
+    X509_free(x509);
+    BIO_free(bio);
+    return pkey;
 }
 
 // JWKS Cache Updater Thread
 void jwks_updater() {
     {
-        // ✅ Perform initial JWKS fetch at startup
-        std::lock_guard<std::mutex> lock(jwks_mutex);
+        std::lock_guard<std::mutex> lock_jwks(jwks_mutex);
         jwks_cache = fetch_jwks();
         last_jwks_update = time(nullptr);
 
         if (!jwks_cache.empty()) {
             log_message(INFO, "Initial JWKS cache populated.");
+
+            try {
+                json parsed = json::parse(jwks_cache);
+                std::lock_guard<std::mutex> lock_map(jwks_map_mutex);
+                jwks_map.clear();
+
+                for (const auto& key : parsed["keys"]) {
+                    if (key.contains("kid") && key.contains("x5c") && !key["x5c"].empty()) {
+                        string kid = key["kid"].get<string>();
+                        string pem = "-----BEGIN CERTIFICATE-----\n" + key["x5c"][0].get<string>() + "\n-----END CERTIFICATE-----\n";
+                        EVP_PKEY* pubkey = convert_pem_to_evp(pem);
+
+                        if (pubkey) {
+                            jwks_map[kid] = { key, pubkey };
+                            log_message(DEBUG, "Initial JWKS added kid: " + kid);
+                        } else {
+                            log_message(WARN, "Failed to parse PEM for kid: " + kid);
+                        }
+                    }
+                }
+
+                log_message(INFO, "Initial JWKS map loaded with " + to_string(jwks_map.size()) + " keys.");
+            } catch (const std::exception& e) {
+                log_message(ERROR, string("Failed to parse initial JWKS: ") + e.what());
+            }
         } else {
             log_message(ERROR, "Failed to fetch initial JWKS.");
         }
     }
 
     while (running) {
-        std::this_thread::sleep_for(std::chrono::seconds(JWKS_REFRESH_INTERVAL)); // Wait before checking
-
-        std::lock_guard<std::mutex> lock(jwks_mutex);
+        std::this_thread::sleep_for(std::chrono::seconds(JWKS_REFRESH_INTERVAL));
+        std::lock_guard<std::mutex> lock_jwks(jwks_mutex);
 
         time_t now = time(nullptr);
         if (now - last_jwks_update < JWKS_REFRESH_INTERVAL) {
@@ -132,63 +221,125 @@ void jwks_updater() {
         }
 
         string new_jwks = fetch_jwks();
-        if (!new_jwks.empty() && new_jwks != jwks_cache) {
-            jwks_cache = new_jwks;
-            last_jwks_update = now;
-            log_message(INFO, "JWKS cache updated.");
+        if (!new_jwks.empty()) {
+            try {
+                json parsed = json::parse(new_jwks);
+                std::lock_guard<std::mutex> lock_map(jwks_map_mutex);
+
+                unordered_map<string, JwkEntry> updated_map;
+
+                for (const auto& key : parsed["keys"]) {
+                    if (!key.contains("kid") || !key.contains("x5c") || key["x5c"].empty())
+                        continue;
+
+                    string kid = key["kid"].get<string>();
+                    string new_cert = key["x5c"][0].get<string>();
+                    string pem = "-----BEGIN CERTIFICATE-----\n" + new_cert + "\n-----END CERTIFICATE-----\n";
+
+                    auto it = jwks_map.find(kid);
+                    if (it != jwks_map.end() && it->second.key["x5c"][0] == new_cert) {
+                        // No change: reuse public keys
+                        updated_map[kid] = it->second;
+                        log_message(DEBUG, "JWKS unchanged for kid: " + kid);
+                    } else {
+                        // On change make update
+                        EVP_PKEY* pubkey = convert_pem_to_evp(pem);
+                        if (pubkey) {
+                            updated_map[kid] = { key, pubkey };
+                            log_message(DEBUG, "JWKS updated or added kid: " + kid);
+                            if (it != jwks_map.end() && it->second.public_key) {
+                                EVP_PKEY_free(it->second.public_key);
+                            }
+                        } else {
+                            log_message(WARN, "Failed to parse PEM for kid: " + kid);
+                        }
+                    }
+                }
+
+                // Free unused keys
+                for (const auto& [kid, entry] : jwks_map) {
+                    if (updated_map.find(kid) == updated_map.end() && entry.public_key) {
+                        EVP_PKEY_free(entry.public_key);
+                        log_message(DEBUG, "Removed unused key for kid: " + kid);
+                    }
+                }
+
+                jwks_map = std::move(updated_map);
+                last_jwks_update = time(nullptr);
+                log_message(INFO, "JWKS map updated with " + to_string(jwks_map.size()) + " keys.");
+            } catch (const std::exception& e) {
+                log_message(ERROR, string("Failed to parse new JWKS: ") + e.what());
+            }
         } else {
-            log_message(DEBUG, "JWKS unchanged, skipping update.");
+            log_message(WARN, "JWKS update failed or empty.");
         }
     }
 }
 
-// Function to retrieve JWKS from cache
+// Retrieve JWKS from cache
 string get_cached_jwks()
 {
-    std::lock_guard<std::mutex> lock(jwks_mutex);
+    std::lock_guard<std::mutex> lock_jwks(jwks_mutex);
     return jwks_cache;
 }
 
 // Base64 URL decoding
 string base64_url_decode(const string &input)
 {
-    string base64 = input;
-    replace(base64.begin(), base64.end(), '-', '+');
-    replace(base64.begin(), base64.end(), '_', '/');
-    while (base64.size() % 4 != 0)
-        base64 += '=';
+    try{
+        string base64 = input;
+        replace(base64.begin(), base64.end(), '-', '+');
+        replace(base64.begin(), base64.end(), '_', '/');
+        while (base64.size() % 4 != 0)
+            base64 += '=';
 
-    BIO *bio, *b64;
-    int length = base64.size() * 3 / 4;
-    unsigned char *buffer = (unsigned char *)malloc(length);
+        BIO *bio, *b64;
+        int length = base64.size() * 3 / 4;
+        unsigned char *buffer = (unsigned char *)malloc(length);
 
-    bio = BIO_new_mem_buf(base64.c_str(), -1);
-    b64 = BIO_new(BIO_f_base64());
-    BIO_set_flags(b64, BIO_FLAGS_BASE64_NO_NL);
-    bio = BIO_push(b64, bio);
+        bio = BIO_new_mem_buf(base64.c_str(), -1);
+        b64 = BIO_new(BIO_f_base64());
+        BIO_set_flags(b64, BIO_FLAGS_BASE64_NO_NL);
+        bio = BIO_push(b64, bio);
 
-    int decoded_length = BIO_read(bio, buffer, length);
-    BIO_free_all(bio);
-    string output((char *)buffer, decoded_length);
-    free(buffer);
+        int decoded_length = BIO_read(bio, buffer, length);
+        if (decoded_length <= 0) throw runtime_error("Failed to decode base64.");
+        BIO_free_all(bio);
+        string output((char *)buffer, decoded_length);
+        free(buffer);
 
-    return output;
+        return output;
+    } catch (const exception& e) {
+        log_message(ERROR, string("Base64 decode failed: ") + e.what());
+        return "";
+    }
+    
 }
 
-// Extract `kid` from JWT header
+// Extract KID from JWT header
 string extract_kid(const string &token)
 {
+    json header;
     size_t first_dot = token.find('.');
     if (first_dot == string::npos)
         return "";
     string header_b64 = token.substr(0, first_dot);
     string header_json = base64_url_decode(header_b64);
 
-    json header = json::parse(header_json);
+    try {
+        header = json::parse(header_json);
+    } catch (const std::exception &e) {
+        log_message(ERROR, string("Failed to parse JWT header JSON: ") + e.what());
+        return "";
+    }
+    if (header["alg"] != "RS256") {
+        log_message(ERROR, "Unsupported JWT algorithm: " + header["alg"].get<string>());
+        return "";
+    }
     return header["kid"];
 }
 
-// Extract and validate expiration (`exp`)
+// Extract and validate expiration EXP
 bool validate_expiration(const string &token)
 {
     size_t first_dot = token.find('.');
@@ -216,76 +367,67 @@ bool validate_expiration(const string &token)
     return true;
 }
 
-// Function to retrieve public key from JWKS cache
-string get_public_key(const string &kid)
+// Function to retrieve cached key
+EVP_PKEY* get_cached_pubkey(const std::string& kid)
 {
-    string jwks_data = get_cached_jwks();
-    if (jwks_data.empty())
-    {
-        log_message(DEBUG, "JWKS cache is empty.");
-        return "";
+    std::lock_guard<std::mutex> lock_map(jwks_map_mutex);
+    if (jwks_map.count(kid)) {
+        return jwks_map[kid].public_key;
     }
-
-    json jwks = json::parse(jwks_data);
-    for (const auto &key : jwks["keys"])
-    {
-        if (key["kid"] == kid)
-        {
-            return "-----BEGIN CERTIFICATE-----\n" + key["x5c"][0].get<string>() + "\n-----END CERTIFICATE-----\n";
-        }
-    }
-    return "";
-}
-
-// Convert PEM certificate to RSA Public Key
-EVP_PKEY *convert_pem_to_evp(const string &pem_cert)
-{
-    BIO *bio = BIO_new_mem_buf(pem_cert.c_str(), -1);
-    X509 *x509 = PEM_read_bio_X509(bio, NULL, NULL, NULL);
-    if (!x509)
-    {
-        BIO_free(bio);
-        throw runtime_error("Failed to parse certificate");
-    }
-
-    EVP_PKEY *pkey = X509_get_pubkey(x509);
-    X509_free(x509);
-    BIO_free(bio);
-    return pkey;
+    log_message(WARN, "KID not found in JWKS map: " + kid);
+    return nullptr;
 }
 
 // Verify JWT Signature
 bool verify_signature(EVP_PKEY *public_key, const string &header_payload, const string &signature)
 {
-    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+    thread_local EVP_MD_CTX *ctx = nullptr;
+
+    if (!ctx) {
+        ctx = EVP_MD_CTX_new();
+        if (!ctx) return false;
+    } else {
+        EVP_MD_CTX_reset(ctx);
+    }
+
     EVP_PKEY_CTX *pkey_ctx = NULL;
     bool result = false;
 
-    if (!ctx)
-        return false;
-
     if (EVP_DigestVerifyInit(ctx, &pkey_ctx, EVP_sha256(), NULL, public_key) <= 0)
-        goto cleanup;
+        return false;
     if (EVP_DigestVerifyUpdate(ctx, header_payload.c_str(), header_payload.size()) <= 0)
-        goto cleanup;
+        return false;
 
     if (EVP_DigestVerifyFinal(ctx, (unsigned char *)signature.data(), signature.size()) == 1)
     {
         result = true;
     }
 
-cleanup:
-    EVP_MD_CTX_free(ctx);
     return result;
 }
 
 // Verify JWT
 bool verify_jwt(const string &token)
 {
-    try
-    {
-        if (!validate_expiration(token))
+    struct TimerGuard {
+        std::chrono::high_resolution_clock::time_point start;
+        TimerGuard() {
+            jwt_validations_in_progress++;
+            start = std::chrono::high_resolution_clock::now();
+        }
+        ~TimerGuard() {
+            auto end = std::chrono::high_resolution_clock::now();
+            auto duration_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
+            total_validation_time_ns += duration_ns;
+            jwt_validations_in_progress--;
+        }
+    } guard;  // <-- Se activa aquí
+
+    try {
+        if (!validate_expiration(token)){
+            log_message(WARN, "Token failed expiration check.");
             return false;
+        }
 
         size_t first_dot = token.find('.');
         size_t second_dot = token.find('.', first_dot + 1);
@@ -296,111 +438,109 @@ bool verify_jwt(const string &token)
         string signature_b64 = token.substr(second_dot + 1);
         string signature = base64_url_decode(signature_b64);
 
-        string jwks_data = fetch_jwks();
-        json jwks = json::parse(jwks_data);
-
         string kid = extract_kid(token);
-        json key;
-        for (const auto &k : jwks["keys"])
-        {
-            if (k["kid"] == kid)
-            {
-                key = k;
-                break;
-            }
+        log_message(DEBUG, "Request extracted kid: " + kid);
+
+        EVP_PKEY* public_key = get_cached_pubkey(kid);
+        if (!public_key) {
+            log_message(ERROR, "Public key not found for kid: " + kid);
+            return false;
         }
-        if (key.empty())
-            return false;
 
-        EVP_PKEY *public_key = convert_pem_to_evp(get_public_key(kid));
-        if (!public_key)
-            return false;
-
-        bool valid_signature = verify_signature(public_key, header_payload, signature);
-        EVP_PKEY_free(public_key);
-
-        return valid_signature;
-    }
-    catch (...)
-    {
+        return verify_signature(public_key, header_payload, signature);
+    } catch (...) {
         return false;
     }
 }
 
-// HTTP request handler
-MHD_Result request_handler(void *cls, struct MHD_Connection *connection,
-                           const char *url, const char *method, const char *version,
-                           const char *upload_data, size_t *upload_data_size, void **ptr)
-{
+// Start http server
+void start_server() {
+    log_message(INFO, "Starting server with libhv on port " + std::to_string(PORT));
 
-    const char *auth_header = MHD_lookup_connection_value(connection, MHD_HEADER_KIND, "Authorization");
+    hv::HttpService router;
 
-    string response_text;
-    int status_code = MHD_HTTP_FORBIDDEN;
+    router.GET("/metrics", [](HttpRequest* req, HttpResponse* resp) {
+        std::string metrics =
+            "jwt_auth_valid_requests " + std::to_string(valid_requests.load()) + "\n"
+            "jwt_auth_invalid_requests " + std::to_string(invalid_requests.load()) + "\n"
+            "jwt_auth_validation_in_progress " + std::to_string(jwt_validations_in_progress.load()) + "\n"
+            "jwt_auth_validation_total_ns " + std::to_string(total_validation_time_ns.load()) + "\n"
+            "jwt_auth_avg_validation_time_ns " +
+            std::to_string(valid_requests.load() > 0
+                ? total_validation_time_ns.load() / valid_requests.load()
+                : 0) + "\n";
 
-    if (auth_header && strncmp(auth_header, "Bearer ", 7) == 0)
-    {
-        string token(auth_header + 7);
+        resp->status_code = HTTP_STATUS_OK;
+        return resp->String(metrics);
+    });
 
-        if (verify_jwt(token))
-        {
-            response_text = "JWT is valid.";
-            status_code = MHD_HTTP_OK;
+    router.GET("/", [](HttpRequest* req, HttpResponse* resp) {
+        std::string auth = req->GetHeader("Authorization");
+        std::string response;
+        int code = 403;
+
+        if (!auth.empty() && auth.rfind("Bearer ", 0) == 0) {
+            std::string token = auth.substr(7);
+
+            if (verify_jwt(token)) {
+                valid_requests++;
+                response = "JWT is valid.";
+                code = 200;
+                log_message(INFO, "Valid JWT received");
+            } else {
+                invalid_requests++;
+                response = "JWT verification failed.";
+                log_message(WARN, "JWT verification failed");
+            }
+        } else {
+            response = "Missing or invalid Authorization header.";
+            log_message(WARN, "No valid Authorization header");
         }
-        else
-        {
-            response_text = "JWT verification failed.";
-        }
-    }
 
-    struct MHD_Response *response = MHD_create_response_from_buffer(response_text.size(),
-                                                                    (void *)response_text.c_str(),
-                                                                    MHD_RESPMEM_MUST_COPY);
-    int ret = MHD_queue_response(connection, status_code, response);
-    MHD_destroy_response(response);
-    return static_cast<MHD_Result>(ret);
-}
+        resp->status_code = static_cast<http_status>(code);
+        return resp->String(response);
+    });
 
-// Start HTTP server
-void start_server()
-{
-    log_message(INFO, "HTTP Server running on port " + to_string(PORT));
+    hv::HttpServer server;
+    server.service = &router;
+    server.port = PORT;
+    unsigned int threads = std::thread::hardware_concurrency();
+    if (threads == 0) threads = 4;
+    server.setThreadNum(threads);
 
-    http_daemon = MHD_start_daemon(MHD_USE_THREAD_PER_CONNECTION, PORT,
-                                   NULL, NULL, &request_handler, NULL,
-                                   MHD_OPTION_END);
-    if (!daemon)
-    {
+    if (server.start() != 0) {
         log_message(ERROR, "Failed to start HTTP server.");
         return;
     }
 
-    // Wait until signal is received
-    while (running)
-    {
-        sleep(1); // Prevents busy-waiting
-    }
+    std::unique_lock<std::mutex> lock(shutdown_mutex);
+    shutdown_cv.wait(lock, [] { return !running.load(); });
 
-    log_message(INFO, "Stopping HTTP server...");
-    MHD_stop_daemon(http_daemon);
+    server.stop();
+}
+
+void signal_handler(int signum) {
+    running = false;
+    shutdown_cv.notify_all();  // Esta es la mejora
+    log_message(INFO, "Received signal " + std::to_string(signum));
 }
 
 // Main function
-int main()
-{
+int main() {
     set_log_level();
 
-    thread(jwks_updater).detach();
+    signal(SIGINT, signal_handler);
+    signal(SIGTERM, signal_handler);
 
-    // Setup signal handlers
-    struct sigaction action{};
-    action.sa_handler = signal_handler;
-    sigemptyset(&action.sa_mask);
-    action.sa_flags = 0;
+    std::thread jwks_thread(jwks_updater);  // sin while redundante
 
-    sigaction(SIGINT, &action, NULL);
-    sigaction(SIGTERM, &action, NULL);
+    start_server();  // espera hasta que se recibe señal y se desbloquea el shutdown
 
-    start_server();
+    if (jwks_thread.joinable()) {
+        jwks_thread.join();
+    }
+
+    log_message(INFO, "Server shutdown complete.");
     return 0;
 }
+

@@ -1,10 +1,10 @@
 # ──────────────────────────────
-# 1️⃣ BUILD STAGE: Compile Binary
+# BUILD STAGE: Compile Binary
 # ──────────────────────────────
 FROM ubuntu:22.04 AS builder
 
 ENV DEBIAN_FRONTEND=noninteractive
-
+ENV LD_LIBRARY_PATH=/usr/local/lib:$LD_LIBRARY_PATH
 
 # Install dependencies
 RUN apt-get update && apt-get upgrade -y && \
@@ -13,11 +13,18 @@ RUN apt-get update && apt-get upgrade -y && \
     build-essential \
     cmake \
     curl \
+    git \
     libcurl4-openssl-dev \
     libssl-dev \
-    libmicrohttpd-dev \
     nlohmann-json3-dev \
     && rm -rf /var/lib/apt/lists/*
+
+# Build libhv
+RUN git clone --depth 1 https://github.com/ithewei/libhv.git /tmp/libhv && \
+    cd /tmp/libhv && mkdir build && cd build && \
+    cmake -DBUILD_SHARED_LIBS=ON .. && make -j$(nproc) && make install && \
+    ldconfig && \
+    rm -rf /tmp/libhv
 
 # Set working directory
 WORKDIR /app
@@ -26,21 +33,27 @@ WORKDIR /app
 COPY CMakeLists.txt . 
 COPY src ./src
 
-# Build the application
+# Build app
 RUN cmake -B build -S . && cmake --build build --target all
 
 # ──────────────────────────────
-# 2️⃣ RUNTIME STAGE: Minimal Image with Compiled Binary
+# RUNTIME STAGE: Minimal Image with Compiled Binary
 # ──────────────────────────────
 FROM ubuntu:22.04 AS runtime
 
-# Install runtime dependencies (only what is needed)
+# Install runtime dependencies 
 RUN apt-get update && apt-get install -y \
     curl \
     libcurl4 \
     libssl3 \
-    libmicrohttpd12 \
     && rm -rf /var/lib/apt/lists/*
+
+# Add libhv runtime dependency
+COPY --from=builder /usr/local/lib/libhv.so /usr/local/lib/libhv.so
+COPY --from=builder /usr/local/lib/ /usr/local/lib/
+
+# Refresh ld cache
+RUN ldconfig
 
 # Set working directory
 WORKDIR /app
@@ -51,5 +64,5 @@ COPY --from=builder /app/build/auth-server /app/auth-server
 # Expose server port
 EXPOSE 3000
 
-# Run the application
+# Run app
 CMD ["/app/auth-server"]

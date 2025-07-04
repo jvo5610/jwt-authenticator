@@ -2,7 +2,7 @@
 REPO ?= pepe5610/auth-server
 TAG ?= latest
 PLATFORMS ?= linux/amd64,linux/arm64
-AUTH0_DOMAIN ?= https://dev-pxmvvr03py33pdxk.us.auth0.com/.well-known/jwks.json
+AUTH0_DOMAIN ?=
 
 # Default target
 .PHONY: build push run clean
@@ -32,3 +32,4 @@ inspect:
 setup:
 	docker buildx create --use
 	docker buildx ls
+	
